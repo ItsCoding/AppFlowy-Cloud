@@ -213,6 +213,16 @@ pub struct MovePageParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReorderFavoritePageParams {
+  pub prev_view_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddRecentPagesParams {
+  pub recent_view_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DuplicatePageParams {
   pub suffix: Option<String>,
 }

@@ -14,10 +14,10 @@ use crate::biz::workspace::ops::{
   get_reactions_on_published_view, remove_comment_on_published_view, remove_reaction_on_comment,
 };
 use crate::biz::workspace::page_view::{
-  append_block_at_the_end_of_page, create_database_view, create_page, create_space,
-  delete_all_pages_from_trash, delete_trash, favorite_page, get_page_view_collab, move_page,
-  move_page_to_trash, publish_page, restore_all_pages_from_trash, restore_page_from_trash,
-  unpublish_page, update_page, update_page_collab_data, update_space,
+  add_recent_pages, append_block_at_the_end_of_page, create_database_view, create_page,
+  create_space, delete_all_pages_from_trash, delete_trash, favorite_page, get_page_view_collab,
+  move_page, move_page_to_trash, publish_page, reorder_favorite_page, restore_all_pages_from_trash,
+  restore_page_from_trash, unpublish_page, update_page, update_page_collab_data, update_space,
 };
 use crate::biz::workspace::publish::get_workspace_default_publish_view_info_meta;
 use crate::biz::workspace::quick_note::{
@@ -190,6 +190,10 @@ pub fn workspace_scope() -> Scope {
         .route(web::post().to(move_page_handler)),
     )
     .service(
+      web::resource("/{workspace_id}/page-view/{view_id}/reorder-favorite")
+        .route(web::post().to(reorder_favorite_page_handler)),
+    )
+    .service(
           web::resource("/{workspace_id}/page-view/{view_id}/duplicate")
             .route(web::post().to(duplicate_page_handler)),
         )
@@ -204,6 +208,10 @@ pub fn workspace_scope() -> Scope {
     .service(
       web::resource("/{workspace_id}/page-view/{view_id}/restore-from-trash")
         .route(web::post().to(restore_page_from_trash_handler)),
+    )
+    .service(
+      web::resource("/{workspace_id}/add-recent-pages")
+        .route(web::post().to(add_recent_pages_handler)),
     )
     .service(
       web::resource("/{workspace_id}/restore-all-pages-from-trash")
@@ -815,7 +823,7 @@ async fn create_collab_handler(
       let pending = UnindexedCollabTask::new(
         workspace_id_uuid,
         params.object_id.clone(),
-        params.collab_type.clone(),
+        params.collab_type,
         UnindexedData::Text(text),
       );
       state
@@ -962,11 +970,7 @@ async fn batch_create_collab_handler(
   {
     pending_undexed_collabs = collab_params_list
       .iter_mut()
-      .filter(|p| {
-        state
-          .indexer_scheduler
-          .is_indexing_enabled(&p.1.collab_type)
-      })
+      .filter(|p| state.indexer_scheduler.is_indexing_enabled(p.1.collab_type))
       .flat_map(|value| match std::mem::take(&mut value.0) {
         None => None,
         Some(text) => text
@@ -974,7 +978,7 @@ async fn batch_create_collab_handler(
             UnindexedCollabTask::new(
               workspace_id_uuid,
               value.1.object_id.clone(),
-              value.1.collab_type.clone(),
+              value.1.collab_type,
               UnindexedData::Text(text),
             )
           })
@@ -1138,7 +1142,7 @@ async fn post_web_update_handler(
   trace!("create onetime web realtime user: {}", user);
 
   let payload = payload.into_inner();
-  let collab_type = payload.collab_type.clone();
+  let collab_type = payload.collab_type;
 
   update_page_collab_data(
     &state.metrics.appflowy_web_metrics,
@@ -1293,6 +1297,30 @@ async fn move_page_handler(
   Ok(Json(AppResponse::Ok()))
 }
 
+async fn reorder_favorite_page_handler(
+  user_uuid: UserUuid,
+  path: web::Path<(Uuid, String)>,
+  payload: Json<ReorderFavoritePageParams>,
+  state: Data<AppState>,
+  server: Data<RealtimeServerAddr>,
+  req: HttpRequest,
+) -> Result<Json<AppResponse<()>>> {
+  let uid = state.user_cache.get_user_uid(&user_uuid).await?;
+  let (workspace_uuid, view_id) = path.into_inner();
+  let user = realtime_user_for_web_request(req.headers(), uid)?;
+  reorder_favorite_page(
+    &state.metrics.appflowy_web_metrics,
+    server,
+    user,
+    &state.collab_access_control_storage,
+    workspace_uuid,
+    &view_id,
+    payload.prev_view_id.as_deref(),
+  )
+  .await?;
+  Ok(Json(AppResponse::Ok()))
+}
+
 async fn duplicate_page_handler(
   user_uuid: UserUuid,
   path: web::Path<(Uuid, Uuid)>,
@@ -1359,6 +1387,30 @@ async fn restore_page_from_trash_handler(
     &state.collab_access_control_storage,
     workspace_uuid,
     &view_id,
+  )
+  .await?;
+  Ok(Json(AppResponse::Ok()))
+}
+
+async fn add_recent_pages_handler(
+  user_uuid: UserUuid,
+  path: web::Path<Uuid>,
+  payload: Json<AddRecentPagesParams>,
+  state: Data<AppState>,
+  server: Data<RealtimeServerAddr>,
+  req: HttpRequest,
+) -> Result<Json<AppResponse<()>>> {
+  let uid = state.user_cache.get_user_uid(&user_uuid).await?;
+  let workspace_uuid = path.into_inner();
+  let user = realtime_user_for_web_request(req.headers(), uid)?;
+  let AddRecentPagesParams { recent_view_ids } = payload.into_inner();
+  add_recent_pages(
+    &state.metrics.appflowy_web_metrics,
+    server,
+    user,
+    &state.collab_access_control_storage,
+    workspace_uuid,
+    recent_view_ids,
   )
   .await?;
   Ok(Json(AppResponse::Ok()))
@@ -1649,7 +1701,7 @@ async fn create_collab_snapshot_handler(
     .collab_access_control_storage
     .get_encode_collab(
       GetCollabOrigin::User { uid },
-      QueryCollabParams::new(&object_id, collab_type.clone(), &workspace_id),
+      QueryCollabParams::new(&object_id, collab_type, &workspace_id),
       true,
     )
     .await?
@@ -1748,7 +1800,7 @@ async fn update_collab_handler(
           let pending = UnindexedCollabTask::new(
             workspace_id_uuid,
             params.object_id.clone(),
-            params.collab_type.clone(),
+            params.collab_type,
             UnindexedData::Text(text),
           );
           state
